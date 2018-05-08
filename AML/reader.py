@@ -4,11 +4,11 @@ import re
 import math
 import pickle
 
-TRAIN_FILE='data/train_2.csv'
-KEYS_FILE='data/key_2.csv'
+TRAIN_FILE='train_sample.csv'
+KEYS_FILE='key_sample.csv'
 
-TRAIN_BINARY='data/train_2.pkl'
-KEYS_BINARY='data/keys_2.pkl'
+TRAIN_BINARY='train_sample.pkl'
+KEYS_BINARY='key_sample.pkl'
 
 
 

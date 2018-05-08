@@ -5,6 +5,11 @@ import math
 from reader import *
 from loss import *
 
+def smape(y_true, y_pred):
+	denominator = (np.abs(y_true) + np.abs(y_pred)) / 2.0
+	diff = np.abs(y_true - y_pred) / denominator
+	diff[denominator == 0] = 0.0
+	return np.nanmean(diff)
 
 
 
@@ -12,7 +17,7 @@ train, test =read()
 
 
 def median(train, test):
-	Windows = [6, 12, 18, 30, 48, 78, 126, 203, 329]
+	Windows = [6, 12, 18, 30, 48, 78]
 	n = train.shape[1] - 1
 	#print(n)
 	Visits = np.zeros(train.shape[0])
@@ -46,4 +51,22 @@ def median(train, test):
 
 	print('Creating submission file')
 	test = test.merge(train[['Page','Visits']], on='Page', how='left')
-	test[['Id','Visits']].to_csv('sub.csv', index=False)
+	test[['Id','Visits']].to_csv('sub_baseline.csv', index=False)
+
+	
+
+
+median(train,test)
+actual=pd.read_csv("test.csv")
+actual=actual.drop("Id",axis=1)
+actual=actual.values
+
+predictions=pd.read_csv("sub_baseline.csv")
+predictions=predictions.drop("Id",axis=1)
+predictions=predictions.values
+
+print('Final Smape score is : ', smape(actual,predictions))
+
+
+
+

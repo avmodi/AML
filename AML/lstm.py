@@ -4,9 +4,11 @@ import matplotlib.pyplot as plt
 from reader import *
 
 
-train,test = read() 
+train,test = read()
 page = train['Page']
 train = train.drop('Page',axis = 1)
+
+train=np.log1p(train)
 
 m=train.shape[1]
 n=train.shape[0]
