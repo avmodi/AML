@@ -2,7 +2,7 @@ import numpy as np
 import pandas as pd
 import datetime
 from matplotlib import pyplot as plt
-
+from loss import *
 from tqdm import tqdm
 import gc
 
@@ -23,45 +23,110 @@ import keras
 from sklearn.preprocessing import MinMaxScaler, StandardScaler
 from sklearn.model_selection import GroupKFold
 
+import keras.backend as K
 
-np.random.seed = 0
+def smape_error(y_true, y_pred):
+	return K.mean(K.clip(K.abs(y_pred - y_true),  0.0, 1.0), axis=-1)
 
-def smape(y_true, y_pred):
-	denominator = (np.abs(y_true) + np.abs(y_pred)) / 2.0
-	diff = np.abs(y_true - y_pred) / denominator
-	diff[denominator == 0] = 0.0
-	return np.nanmean(diff)
+
+
+
+# all visits is median
+def add_median(test, train, train_diff, train_diff7, train_diff7m,
+			   train_key, periods, max_periods, first_train_weekday):
+	train =  train.iloc[:,:7*max_periods]
+	
+	df = train_key[['Page']].copy()
+	df['AllVisits'] = train.median(axis=1).fillna(0)
+	test = test.merge(df, how='left', on='Page', copy=False)
+	test.AllVisits = test.AllVisits.fillna(0).astype('float32')
+	
+	for site in sites:
+		test[site] = (1 * (test.Site == site)).astype('float32')
+	
+	for access in accesses:
+		test[access] = (1 * (test.AccessAgent == access)).astype('float32')
+
+	for (w1, w2) in periods:
+		
+		df = train_key[['Page']].copy()
+		c = 'median_%d_%d' % (w1, w2)
+		cm = 'mean_%d_%d' % (w1, w2)
+		cmax = 'max_%d_%d' % (w1, w2)
+		cd = 'median_diff_%d_%d' % (w1, w2)
+		cd7 = 'median_diff7_%d_%d' % (w1, w2)
+		cd7m = 'median_diff7m_%d_%d' % (w1, w2)
+		cd7mm = 'mean_diff7m_%d_%d' % (w1, w2)
+		df[c] = train.iloc[:,7*w1:7*w2].median(axis=1, skipna=True) 
+		df[cm] = train.iloc[:,7*w1:7*w2].mean(axis=1, skipna=True) 
+		df[cmax] = train.iloc[:,7*w1:7*w2].max(axis=1, skipna=True) 
+		df[cd] = train_diff.iloc[:,7*w1:7*w2].median(axis=1, skipna=True) 
+		df[cd7] = train_diff7.iloc[:,7*w1:7*w2].median(axis=1, skipna=True) 
+		df[cd7m] = train_diff7m.iloc[:,7*w1:7*w2].median(axis=1, skipna=True) 
+		df[cd7mm] = train_diff7m.iloc[:,7*w1:7*w2].mean(axis=1, skipna=True) 
+		test = test.merge(df, how='left', on='Page', copy=False)
+		test[c] = (test[c] - test.AllVisits).fillna(0).astype('float32')
+		test[cm] = (test[cm] - test.AllVisits).fillna(0).astype('float32')
+		test[cmax] = (test[cmax] - test.AllVisits).fillna(0).astype('float32')
+		test[cd] = (test[cd] ).fillna(0).astype('float32')
+		test[cd7] = (test[cd7] ).fillna(0).astype('float32')
+		test[cd7m] = (test[cd7m] ).fillna(0).astype('float32')
+		test[cd7mm] = (test[cd7mm] ).fillna(0).astype('float32')
+
+	for c_norm, c in zip(y_norm_cols, y_cols):
+		test[c_norm] = (np.log1p(test[c]) - test.AllVisits).astype('float32')
+
+	gc.collect()
+
+	return test
 
 def smape2D(y_true, y_pred):
 	return smape(np.ravel(y_true), np.ravel(y_pred))
 	
-def smape_mask(y_true, y_pred, threshold):
-	denominator = (np.abs(y_true) + np.abs(y_pred)) 
-	diff = np.abs(y_true - y_pred) 
-	diff[denominator == 0] = 0.0
+
+def get_model(input_dim, num_sites, num_accesses, output_dim):
 	
-	return diff <= (threshold / 2.0) * denominator
+	dropout = 0.5
+	regularizer = 0.00004
+	main_input = Input(shape=(input_dim,), dtype='float32', name='main_input')
+	site_input = Input(shape=(num_sites,), dtype='float32', name='site_input')
+	access_input = Input(shape=(num_accesses,), dtype='float32', name='access_input')
+	
+	
+	x0 = keras.layers.concatenate([main_input, site_input, access_input])
+	x = Dense(200, activation='relu', 
+			  kernel_initializer='lecun_uniform', kernel_regularizer=regularizers.l2(regularizer))(x0)
+	x = Dropout(dropout)(x)
+	x = keras.layers.concatenate([x0, x])
+	x = Dense(200, activation='relu', 
+			  kernel_initializer='lecun_uniform', kernel_regularizer=regularizers.l2(regularizer))(x)
+	x = BatchNormalization(beta_regularizer=regularizers.l2(regularizer),
+						   gamma_regularizer=regularizers.l2(regularizer)
+						  )(x)
+	x = Dropout(dropout)(x)
+	x = Dense(100, activation='relu', 
+			  kernel_initializer='lecun_uniform', kernel_regularizer=regularizers.l2(regularizer))(x)
+	x = Dropout(dropout)(x)
 
+	x = Dense(200, activation='relu', 
+			  kernel_initializer='lecun_uniform', kernel_regularizer=regularizers.l2(regularizer))(x)
+	x = Dropout(dropout)(x)
+	x = Dense(output_dim, activation='linear', 
+			  kernel_initializer='lecun_uniform', kernel_regularizer=regularizers.l2(regularizer))(x)
 
-max_sizemax_siz  = 181 # number of days in 2015 with 3 days before end
+	model =  Model(inputs=[main_input, site_input, access_input], outputs=[x])
+	model.compile(loss=smape_error, optimizer='adam')
+	return model
 
+np.random.seed = 0
+max_size = 181 
 offset = 1/2
 
+# Read train csv file
 train_all = pd.read_csv("train_sample.csv")
-train_all.head()
-
-max_size = 181 # number of days in 2015 with 3 days before end
-
-offset = 1/2
-
-train_all = pd.read_csv("train_sample.csv")
-print(train_all.head())
-
-
 all_page  = train_all.Page.copy()
 train_key = train_all[['Page']].copy()
 train_all = train_all.iloc[:,1:] * offset 
-train_all.head()
 
 def get_date_index(date, train_all=train_all):
 	for idx, c in enumerate(train_all.columns):
@@ -71,11 +136,14 @@ def get_date_index(date, train_all=train_all):
 		return None
 	return idx
 
+
+
 trains = []
 tests = []
 train_end = get_date_index('2016-09-10') + 1
 test_start = get_date_index('2016-09-13')
 
+# Train test
 for i in range(-3,4):
 	train = train_all.iloc[ : , (train_end - max_size + i) : train_end + i].copy().astype('float32')
 	test = train_all.iloc[:, test_start + i : (63 + test_start) + i].copy().astype('float32')
@@ -96,26 +164,26 @@ access = ['_'.join(page[-2:]) for page in data]
 site = [page[-3] for page in data]
 
 page = ['_'.join(page[:-3]) for page in data]
-page[:2]
+
 
 train_key['PageTitle'] = page
 train_key['Site'] = site
 train_key['AccessAgent'] = access
-train_key.head()
 
+# Normalization
 train_norms = [np.log1p(train).astype('float32') for train in trains]
-train_norms[3].head()
+
 
 train_all_norm = np.log1p(train_all).astype('float32')
-train_all_norm.head()
+#train_all_norm.head()
 
 for i,test in enumerate(tests):
-	first_day = i-2 # 2016-09-13 is a Tuesday
-	test_columns_date = list(test.columns)
-	test_columns_code = ['w%d_d%d' % (i // 7, (first_day + i) % 7) for i in range(63)]
-	test.columns = test_columns_code
+ 	first_day = i-2
+ 	test_columns_date = list(test.columns)
+ 	test_columns_code = ['w%d_d%d' % (i // 7, (first_day + i) % 7) for i in range(63)]
+ 	test.columns = test_columns_code
 
-tests[3].head()
+#tests[3].head()
 
 for test in tests:
 	test.fillna(0, inplace=True)
@@ -126,7 +194,7 @@ for test in tests:
 
 tests = [test.merge(train_key, how='left', on='Page', copy=False) for test in tests]
 
-tests[3].head()
+#tests[3].head()
 
 
 test_all_id = pd.read_csv('key_sample.csv')
@@ -134,7 +202,7 @@ print(test_all_id.head())
 
 test_all_id['Date'] = [page[-10:] for page in tqdm(test_all_id.Page)]
 test_all_id['Page'] = [page[:-11] for page in tqdm(test_all_id.Page)]
-test_all_id.head()
+#test_all_id.head()
 
 test_all = test_all_id.drop('Id', axis=1)
 test_all['Visits_true'] = np.NaN
@@ -146,20 +214,16 @@ test_all['2017-11-14'] = np.NaN
 test_all.sort_values(by='Page', inplace=True)
 test_all.reset_index(drop=True, inplace=True)
 
-test_all.head()
-
-print(test_all.shape)
-
 test_all_columns_date = list(test_all.columns[1:])
-first_day = 2 # 2017-13-09 is a Wednesday
+first_day = 2 
 test_all_columns_code = ['w%d_d%d' % (i // 7, (first_day + i) % 7) for i in range(63)]
 cols = ['Page']
 cols.extend(test_all_columns_code)
 test_all.columns = cols
-test_all.head()
+# test_all.head()
 
 test_all = test_all.merge(train_key, how='left', on='Page')
-test_all.head()
+# test_all.head()
 
 y_cols = test.columns[:63]
 
@@ -167,14 +231,8 @@ for test in tests:
 	test.reset_index(inplace=True)
 test_all = test_all.reset_index()
 
-print(test_all.shape)
-
 test = pd.concat(tests[2:5], axis=0).reset_index(drop=True)
-
-print(test.head)
-
 test_all = test_all[test.columns].copy()
-
 train_cols = ['d_%d' % i for i in range(train_norms[0].shape[1])]
 print(len(train_cols))
 
@@ -227,54 +285,7 @@ test_all0 = test_all.copy()
 y_norm_cols = [c+'_norm' for c in y_cols]
 y_pred_cols = [c+'_pred' for c in y_cols]
 
-# all visits is median
-def add_median(test, train, train_diff, train_diff7, train_diff7m,
-			   train_key, periods, max_periods, first_train_weekday):
-	train =  train.iloc[:,:7*max_periods]
-	
-	df = train_key[['Page']].copy()
-	df['AllVisits'] = train.median(axis=1).fillna(0)
-	test = test.merge(df, how='left', on='Page', copy=False)
-	test.AllVisits = test.AllVisits.fillna(0).astype('float32')
-	
-	for site in sites:
-		test[site] = (1 * (test.Site == site)).astype('float32')
-	
-	for access in accesses:
-		test[access] = (1 * (test.AccessAgent == access)).astype('float32')
 
-	for (w1, w2) in periods:
-		
-		df = train_key[['Page']].copy()
-		c = 'median_%d_%d' % (w1, w2)
-		cm = 'mean_%d_%d' % (w1, w2)
-		cmax = 'max_%d_%d' % (w1, w2)
-		cd = 'median_diff_%d_%d' % (w1, w2)
-		cd7 = 'median_diff7_%d_%d' % (w1, w2)
-		cd7m = 'median_diff7m_%d_%d' % (w1, w2)
-		cd7mm = 'mean_diff7m_%d_%d' % (w1, w2)
-		df[c] = train.iloc[:,7*w1:7*w2].median(axis=1, skipna=True) 
-		df[cm] = train.iloc[:,7*w1:7*w2].mean(axis=1, skipna=True) 
-		df[cmax] = train.iloc[:,7*w1:7*w2].max(axis=1, skipna=True) 
-		df[cd] = train_diff.iloc[:,7*w1:7*w2].median(axis=1, skipna=True) 
-		df[cd7] = train_diff7.iloc[:,7*w1:7*w2].median(axis=1, skipna=True) 
-		df[cd7m] = train_diff7m.iloc[:,7*w1:7*w2].median(axis=1, skipna=True) 
-		df[cd7mm] = train_diff7m.iloc[:,7*w1:7*w2].mean(axis=1, skipna=True) 
-		test = test.merge(df, how='left', on='Page', copy=False)
-		test[c] = (test[c] - test.AllVisits).fillna(0).astype('float32')
-		test[cm] = (test[cm] - test.AllVisits).fillna(0).astype('float32')
-		test[cmax] = (test[cmax] - test.AllVisits).fillna(0).astype('float32')
-		test[cd] = (test[cd] ).fillna(0).astype('float32')
-		test[cd7] = (test[cd7] ).fillna(0).astype('float32')
-		test[cd7m] = (test[cd7m] ).fillna(0).astype('float32')
-		test[cd7mm] = (test[cd7mm] ).fillna(0).astype('float32')
-
-	for c_norm, c in zip(y_norm_cols, y_cols):
-		test[c_norm] = (np.log1p(test[c]) - test.AllVisits).astype('float32')
-
-	gc.collect()
-
-	return test
 
 max_periods = 16
 periods = [(0,1), (1,2), (2,3), (3,4), 
@@ -282,8 +293,7 @@ periods = [(0,1), (1,2), (2,3), (3,4),
 		   (0,2), (2,4),(4,6),(6,8),
 		   (0,4),(4,8),(8,12),(12,16),
 		   (0,8), (8,16), (0,12), 
-		   (0,16), 
-		  ]
+		   (0,16),]
 
 
 site_cols = list(sites)
@@ -301,6 +311,7 @@ test1 = add_median(test, train_norm, train_norm_diff, train_norm_diff7, train_no
 test_all1 = add_median(test_all, train_all_norm, train_all_norm_diff, train_all_norm_diff7, train_all_norm_diff7m, 
 					   train_key, periods, max_periods, 5)
 
+# Feature Augmentation
 num_cols = (['median_%d_%d' % (w1,w2) for (w1,w2) in periods])
 num_cols.extend(['mean_%d_%d' % (w1,w2) for (w1,w2) in periods])
 num_cols.extend(['max_%d_%d' % (w1,w2) for (w1,w2) in periods])
@@ -308,48 +319,10 @@ num_cols.extend(['median_diff_%d_%d' % (w1,w2) for (w1,w2) in periods])
 num_cols.extend(['median_diff7m_%d_%d' % (w1,w2) for (w1,w2) in periods])
 num_cols.extend(['mean_diff7m_%d_%d' % (w1,w2) for (w1,w2) in periods])
 
-import keras.backend as K
-
-def smape_error(y_true, y_pred):
-	return K.mean(K.clip(K.abs(y_pred - y_true),  0.0, 1.0), axis=-1)
-
-
-def get_model(input_dim, num_sites, num_accesses, output_dim):
-	
-	dropout = 0.5
-	regularizer = 0.00004
-	main_input = Input(shape=(input_dim,), dtype='float32', name='main_input')
-	site_input = Input(shape=(num_sites,), dtype='float32', name='site_input')
-	access_input = Input(shape=(num_accesses,), dtype='float32', name='access_input')
-	
-	
-	x0 = keras.layers.concatenate([main_input, site_input, access_input])
-	x = Dense(200, activation='relu', 
-			  kernel_initializer='lecun_uniform', kernel_regularizer=regularizers.l2(regularizer))(x0)
-	x = Dropout(dropout)(x)
-	x = keras.layers.concatenate([x0, x])
-	x = Dense(200, activation='relu', 
-			  kernel_initializer='lecun_uniform', kernel_regularizer=regularizers.l2(regularizer))(x)
-	x = BatchNormalization(beta_regularizer=regularizers.l2(regularizer),
-						   gamma_regularizer=regularizers.l2(regularizer)
-						  )(x)
-	x = Dropout(dropout)(x)
-	x = Dense(100, activation='relu', 
-			  kernel_initializer='lecun_uniform', kernel_regularizer=regularizers.l2(regularizer))(x)
-	x = Dropout(dropout)(x)
-
-	x = Dense(200, activation='relu', 
-			  kernel_initializer='lecun_uniform', kernel_regularizer=regularizers.l2(regularizer))(x)
-	x = Dropout(dropout)(x)
-	x = Dense(output_dim, activation='linear', 
-			  kernel_initializer='lecun_uniform', kernel_regularizer=regularizers.l2(regularizer))(x)
-
-	model =  Model(inputs=[main_input, site_input, access_input], outputs=[x])
-	model.compile(loss=smape_error, optimizer='adam')
-	return model
 
 group = pd.factorize(test1.Page)[0]
 
+# Hyperparameters
 n_bag = 20
 kf = GroupKFold(n_bag)
 batch_size=4096
@@ -375,6 +348,7 @@ best_all_score = 100
 save_pred = 0
 saved_pred_all = 0
 
+# Execution of Model
 for n_epoch in range(10, 201, 10):
 	print('************** start %d epochs **************************' % n_epoch)
 
@@ -503,4 +477,4 @@ predictions=pd.read_csv("sub_test_sorted.csv")
 predictions=predictions.drop("Id",axis=1)
 predictions=predictions.values
 
-print('Final Smape score is : ', smape(actual,predictions))
+print('Smape Score is ', smape(actual,predictions))
